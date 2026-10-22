@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 )
 
 func TestWithProtection_NamespaceControllerDeletion(t *testing.T) {
@@ -713,6 +714,114 @@ func TestWithGenerateLabelProtection_InvalidResources(t *testing.T) {
 	}
 }
 
+// TestWithGenerateLabelProtection_InheritedLabels covers objects that carry the
+// generate labels only because the controller that created them copied them from
+// a Kyverno-generated parent. cert-manager's Certificate -> CertificateRequest is
+// the reported case: it sets a controller owner reference and assigns the
+// parent's labels verbatim, so every CertificateRequest for a generated
+// Certificate was denied and the certificate could never be issued or renewed.
+func TestWithGenerateLabelProtection_InheritedLabels(t *testing.T) {
+	t.Parallel()
+	const (
+		user        = "system:serviceaccount:cert-manager:cert-manager"
+		kyvernoUser = "system:serviceaccount:kyverno:kyverno-background-controller"
+	)
+	generateLabels := map[string]string{
+		common.GeneratePolicyLabel:     "sync-certs",
+		common.GenerateRuleLabel:       "generate-cert",
+		common.GenerateTriggerUIDLabel: "7c7b4e1e-0f1a-4f6e-9a3f-2b5d8c1a0e42",
+		kyverno.LabelAppManagedBy:      kyverno.ValueKyvernoApp,
+	}
+	retargeted := map[string]string{
+		common.GeneratePolicyLabel:     "other-policy",
+		common.GenerateRuleLabel:       "generate-cert",
+		common.GenerateTriggerUIDLabel: "7c7b4e1e-0f1a-4f6e-9a3f-2b5d8c1a0e42",
+		kyverno.LabelAppManagedBy:      kyverno.ValueKyvernoApp,
+	}
+	tests := []struct {
+		name        string
+		operation   admissionv1.Operation
+		owner       *bool
+		oldLabels   map[string]string
+		newLabels   map[string]string
+		oldOwner    *bool
+		wantAllowed bool
+	}{
+		{
+			name:        "allows inherited labels on create of an owned child",
+			operation:   admissionv1.Create,
+			owner:       ptr.To(true),
+			newLabels:   generateLabels,
+			wantAllowed: true,
+		},
+		{
+			name:      "denies inherited labels on create without a controller owner",
+			operation: admissionv1.Create,
+			owner:     ptr.To(false),
+			newLabels: generateLabels,
+		},
+		{
+			name:      "denies generate labels on create of a standalone object",
+			operation: admissionv1.Create,
+			newLabels: generateLabels,
+		},
+		{
+			name:      "denies retargeting an owned object on update",
+			operation: admissionv1.Update,
+			owner:     ptr.To(true),
+			oldOwner:  ptr.To(true),
+			oldLabels: generateLabels,
+			newLabels: retargeted,
+		},
+		{
+			name:        "allows an unchanged update of an owned object",
+			operation:   admissionv1.Update,
+			owner:       ptr.To(true),
+			oldOwner:    ptr.To(true),
+			oldLabels:   generateLabels,
+			newLabels:   generateLabels,
+			wantAllowed: true,
+		},
+		{
+			name:        "allows ordinary labels on create of an owned child",
+			operation:   admissionv1.Create,
+			owner:       ptr.To(true),
+			newLabels:   map[string]string{"app": "demo"},
+			wantAllowed: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			called := false
+			inner := AdmissionHandler(func(context.Context, logr.Logger, AdmissionRequest, time.Time) AdmissionResponse {
+				called = true
+				return admissionv1.AdmissionResponse{Allowed: true}
+			})
+			request := AdmissionRequest{AdmissionRequest: admissionv1.AdmissionRequest{
+				UID:       types.UID("inherited-labels"),
+				Operation: test.operation,
+				Kind:      metav1.GroupVersionKind{Group: "cert-manager.io", Version: "v1", Kind: "CertificateRequest"},
+				Namespace: "tenant",
+				Name:      "test-1",
+				UserInfo:  authenticationv1.UserInfo{Username: user},
+			}}
+			request.Object.Raw = resourceWithOwner(t, test.newLabels, test.owner)
+			if test.operation != admissionv1.Create {
+				request.OldObject.Raw = resourceWithOwner(t, test.oldLabels, test.oldOwner)
+			}
+
+			response := inner.WithGenerateLabelProtection(kyvernoUser)(context.Background(), logr.Discard(), request, time.Now())
+			assert.Equal(t, test.wantAllowed, response.Allowed)
+			assert.Equal(t, test.wantAllowed, called)
+			if !test.wantAllowed && assert.NotNil(t, response.Result) {
+				assert.Contains(t, response.Result.Message, "generate labels can only be set by Kyverno")
+			}
+		})
+	}
+}
+
 func resourceWithLabels(t *testing.T, labels map[string]string) []byte {
 	t.Helper()
 	resource := map[string]interface{}{
@@ -723,6 +832,36 @@ func resourceWithLabels(t *testing.T, labels map[string]string) []byte {
 			"namespace": "tenant",
 			"labels":    labels,
 		},
+	}
+	raw, err := json.Marshal(resource)
+	assert.NoError(t, err)
+	return raw
+}
+
+// resourceWithOwner builds a resource whose owner reference is absent when
+// controller is nil, and otherwise present with that Controller value.
+func resourceWithOwner(t *testing.T, labels map[string]string, controller *bool) []byte {
+	t.Helper()
+	metadata := map[string]interface{}{
+		"name":      "test-1",
+		"namespace": "tenant",
+		"labels":    labels,
+	}
+	if controller != nil {
+		metadata["ownerReferences"] = []interface{}{
+			map[string]interface{}{
+				"apiVersion": "cert-manager.io/v1",
+				"kind":       "Certificate",
+				"name":       "test",
+				"uid":        "4d9f2a10-8c3b-4e55-9f0a-1c6e7b2d3f81",
+				"controller": *controller,
+			},
+		}
+	}
+	resource := map[string]interface{}{
+		"apiVersion": "cert-manager.io/v1",
+		"kind":       "CertificateRequest",
+		"metadata":   metadata,
 	}
 	raw, err := json.Marshal(resource)
 	assert.NoError(t, err)
